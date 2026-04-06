@@ -256,7 +256,7 @@ def fetch_iv_data(site_no: str, days_back: int) -> dict[str, Any]:
                 numeric_value = np.nan
             rows.append(
                 {
-                    "datetime": pd.to_datetime(item.get("dateTime"), errors="coerce"),
+                    "datetime": pd.to_datetime(item.get("dateTime"), errors="coerce", utc=True),
                     "value": numeric_value,
                 }
             )
@@ -328,9 +328,10 @@ def build_hydrograph(discharge_df: pd.DataFrame, station_name: str) -> go.Figure
         fig.update_layout(title=f"No discharge data available for {station_name}")
         return fig
 
-    df = df.sort_values("datetime")
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+    df = df.dropna(subset=["datetime"]).sort_values("datetime")
     df = df.set_index("datetime")
-    df["rolling_24h"] = df["value"].rolling("24H", min_periods=2).mean()
+    df["rolling_24h"] = df["value"].rolling("24h", min_periods=2).mean()
     window_mean = df["value"].mean()
 
     fig.add_trace(
