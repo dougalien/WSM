@@ -19,6 +19,7 @@ load_dotenv()
 
 APP_TITLE = "River Explorer — Guided USGS Hydrology"
 USGS_IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
+USGS_DV_URL = "https://waterservices.usgs.gov/nwis/dv/"
 USGS_SITE_URL = "https://waterservices.usgs.gov/nwis/site/"
 USER_AGENT = "We are dougalien River Explorer/1.0"
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -275,6 +276,206 @@ def fetch_iv_data(site_no: str, days_back: int) -> dict[str, Any]:
     }
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_dv_data(site_no: str, days_back: int) -> pd.DataFrame:
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=days_back)
+    params = {
+        "format": "json",
+        "sites": site_no,
+        "parameterCd": "00060",
+        "statCd": "00003",
+        "startDT": start_dt.strftime("%Y-%m-%d"),
+        "endDT": end_dt.strftime("%Y-%m-%d"),
+    }
+    response = requests.get(
+        USGS_DV_URL,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    series_list = payload.get("value", {}).get("timeSeries", [])
+    if not series_list:
+        return pd.DataFrame(columns=["date", "value", "unit"])
+
+    series = series_list[0]
+    unit = series.get("variable", {}).get("unit", {}).get("unitCode", "ft3/s")
+    values = series.get("values", [{}])[0].get("value", [])
+
+    rows = []
+    for item in values:
+        try:
+            numeric_value = float(item.get("value"))
+        except Exception:
+            numeric_value = np.nan
+        rows.append(
+            {
+                "date": pd.to_datetime(item.get("dateTime"), errors="coerce").normalize(),
+                "value": numeric_value,
+                "unit": unit,
+            }
+        )
+
+    return pd.DataFrame(rows).dropna(subset=["date"]).sort_values("date")
+
+
+def hysep_interval_days(drainage_area_sqmi: float | None) -> int:
+    if drainage_area_sqmi is None or pd.isna(drainage_area_sqmi) or drainage_area_sqmi <= 0:
+        return 5
+    interval = int(round(2 * (float(drainage_area_sqmi) ** 0.2)))
+    if interval % 2 == 0:
+        interval += 1
+    interval = max(3, min(11, interval))
+    return interval
+
+
+def estimate_baseflow_local_minimum(
+    dv_df: pd.DataFrame,
+    drainage_area_sqmi: float | None = None,
+    interval_days: int | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if dv_df.empty:
+        return pd.DataFrame(), {}
+
+    df = dv_df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(), {}
+
+    interval = interval_days or hysep_interval_days(drainage_area_sqmi)
+    if interval % 2 == 0:
+        interval += 1
+    half = interval // 2
+    flows = df["value"].to_numpy(dtype=float)
+    n = len(df)
+
+    minima_idx: list[int] = []
+    for i in range(n):
+        left = max(0, i - half)
+        right = min(n, i + half + 1)
+        window = flows[left:right]
+        if len(window) == 0 or np.all(np.isnan(window)):
+            continue
+        current = flows[i]
+        if np.isnan(current):
+            continue
+        if current == np.nanmin(window):
+            if not minima_idx or minima_idx[-1] != i:
+                minima_idx.append(i)
+
+    if not minima_idx:
+        minima_idx = [0, n - 1] if n > 1 else [0]
+    else:
+        if minima_idx[0] != 0:
+            minima_idx.insert(0, 0)
+        if minima_idx[-1] != n - 1:
+            minima_idx.append(n - 1)
+
+    x = np.arange(n)
+    baseflow = np.interp(x, minima_idx, flows[minima_idx])
+    baseflow = np.minimum(baseflow, flows)
+    baseflow = np.maximum(baseflow, 0.0)
+    quickflow = np.maximum(flows - baseflow, 0.0)
+
+    df["baseflow"] = baseflow
+    df["quickflow"] = quickflow
+    df["is_local_min"] = False
+    df.loc[minima_idx, "is_local_min"] = True
+
+    total_flow = float(np.nansum(flows))
+    total_baseflow = float(np.nansum(baseflow))
+    bfi = (total_baseflow / total_flow) if total_flow > 0 else np.nan
+
+    summary = {
+        "method": "HYSEP-style local-minimum",
+        "interval_days": int(interval),
+        "bfi": float(bfi) if not np.isnan(bfi) else None,
+        "mean_baseflow": float(np.nanmean(baseflow)) if len(baseflow) else None,
+        "mean_quickflow": float(np.nanmean(quickflow)) if len(quickflow) else None,
+        "latest_baseflow": float(baseflow[-1]) if len(baseflow) else None,
+        "latest_quickflow": float(quickflow[-1]) if len(quickflow) else None,
+        "drainage_area_sqmi": float(drainage_area_sqmi) if drainage_area_sqmi is not None and not pd.isna(drainage_area_sqmi) else None,
+        "unit": str(df["unit"].iloc[0]) if "unit" in df.columns and not df.empty else "ft3/s",
+        "n_days": int(len(df)),
+    }
+    return df, summary
+
+
+def build_baseflow_figure(baseflow_df: pd.DataFrame, station_name: str, summary: dict[str, Any]) -> go.Figure:
+    fig = go.Figure()
+    if baseflow_df.empty:
+        fig.update_layout(title=f"No daily-value baseflow estimate available for {station_name}")
+        return fig
+
+    df = baseflow_df.copy()
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["value"],
+            mode="lines",
+            name="Daily mean discharge",
+            line=dict(width=2),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["baseflow"],
+            mode="lines",
+            name="Estimated baseflow",
+            line=dict(width=2, dash="dash"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["value"],
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["baseflow"],
+            mode="lines",
+            fill="tonexty",
+            name="Quickflow above baseflow",
+            line=dict(width=0),
+            hovertemplate="%{y:.2f}<extra></extra>",
+        )
+    )
+
+    if df["is_local_min"].any():
+        mins = df[df["is_local_min"]]
+        fig.add_trace(
+            go.Scatter(
+                x=mins["date"],
+                y=mins["value"],
+                mode="markers",
+                name="Local minima",
+                marker=dict(size=7),
+            )
+        )
+
+    title_suffix = f" | BFI {summary['bfi']:.2f}" if summary.get("bfi") is not None else ""
+    fig.update_layout(
+        title=f"Baseflow estimate — {station_name}{title_suffix}",
+        xaxis_title="Date",
+        yaxis_title="Discharge (cfs)",
+        legend_title="Series",
+        height=520,
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
+    return fig
+
+
 def compute_hydrology_summary(discharge_df: pd.DataFrame) -> dict[str, Any]:
     if discharge_df.empty:
         return {}
@@ -463,6 +664,7 @@ def init_state() -> None:
     st.session_state.setdefault("student_turns", 0)
     st.session_state.setdefault("guided_complete", False)
     st.session_state.setdefault("days_back", 7)
+    st.session_state.setdefault("baseflow_days", 180)
     st.session_state.setdefault("last_query", "")
 
 
@@ -602,6 +804,61 @@ def main() -> None:
             file_name=f"usgs_{station['site_no']}_discharge.csv",
             mime="text/csv",
         )
+
+        st.subheader("Baseflow Explorer")
+        base_col1, base_col2 = st.columns([1, 2])
+        baseflow_days = base_col1.selectbox(
+            "Daily record length",
+            options=[30, 60, 90, 180, 365],
+            index=[30, 60, 90, 180, 365].index(int(st.session_state.baseflow_days)) if int(st.session_state.baseflow_days) in [30, 60, 90, 180, 365] else 3,
+            help="Baseflow separation works best on daily values over a longer window than the live hydrograph.",
+        )
+        st.session_state.baseflow_days = int(baseflow_days)
+        base_col2.caption("This first version uses daily mean discharge and a conservative HYSEP-style local-minimum separation. It is a teaching estimate, not a replacement for a full USGS toolbox workflow.")
+
+        with st.spinner("Fetching daily values for baseflow analysis..."):
+            try:
+                dv_df = fetch_dv_data(station["site_no"], int(st.session_state.baseflow_days))
+                baseflow_df, baseflow_summary = estimate_baseflow_local_minimum(
+                    dv_df,
+                    drainage_area_sqmi=station.get("drain_area_va"),
+                )
+            except Exception as exc:
+                dv_df = pd.DataFrame()
+                baseflow_df, baseflow_summary = pd.DataFrame(), {}
+                st.error(f"Baseflow analysis failed: {exc}")
+
+        if not baseflow_df.empty and baseflow_summary:
+            bf1, bf2, bf3, bf4 = st.columns(4)
+            bf_unit = baseflow_summary.get("unit", unit)
+            bf1.metric("Baseflow index", f"{baseflow_summary['bfi']:.2f}" if baseflow_summary.get("bfi") is not None else "NA")
+            bf2.metric("Latest baseflow", f"{baseflow_summary['latest_baseflow']:.1f} {bf_unit}" if baseflow_summary.get("latest_baseflow") is not None else "NA")
+            bf3.metric("Latest quickflow", f"{baseflow_summary['latest_quickflow']:.1f} {bf_unit}" if baseflow_summary.get("latest_quickflow") is not None else "NA")
+            bf4.metric("HYSEP interval", f"{baseflow_summary['interval_days']} days")
+
+            bf_fig = build_baseflow_figure(baseflow_df, station_name, baseflow_summary)
+            st.plotly_chart(bf_fig, use_container_width=True)
+
+            with st.expander("Baseflow notes", expanded=True):
+                drainage_text = f"{baseflow_summary['drainage_area_sqmi']:.1f} mi²" if baseflow_summary.get("drainage_area_sqmi") is not None else "not available"
+                st.markdown(
+                    f"**Method:** {baseflow_summary['method']}\n\n"
+                    f"**Daily-value window:** {baseflow_summary['n_days']} days\n\n"
+                    f"**Drainage area used for interval estimate:** {drainage_text}\n\n"
+                    f"**Mean estimated baseflow:** {baseflow_summary['mean_baseflow']:.1f} {bf_unit}\n\n" if baseflow_summary.get("mean_baseflow") is not None else ""
+                )
+                st.markdown(
+                    "This estimate is based on daily mean discharge and local minima connected by straight segments. It is conservative and useful for teaching how much of the hydrograph may be groundwater-supported versus event-driven."
+                )
+
+            base_csv = baseflow_df.copy()
+            base_csv["date"] = base_csv["date"].astype(str)
+            st.download_button(
+                "Download baseflow estimate as CSV",
+                data=base_csv.to_csv(index=False),
+                file_name=f"usgs_{station['site_no']}_baseflow.csv",
+                mime="text/csv",
+            )
 
         st.subheader("Guided interpretation")
         if client is None:
