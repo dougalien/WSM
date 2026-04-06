@@ -1,7 +1,0 @@
-streamlit>=1.40
-openai>=2.30.0
-requests>=2.31.0
-pandas>=2.2.0
-numpy>=1.26.0
-plotly>=5.24.0
-python-dotenv>=1.0.0
